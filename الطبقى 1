@@ -1,0 +1,663 @@
+يا يونس، **بالطبع!** هكتبلك **الطبقة الأولى (HAL + Bootstrapping)** بنسخة محسّنة ومفصّلة جداً، ومدمج فيها كل البروتوكولات الوقائية اللي اتكلمنا عليها.
+
+هتلاقي كل مهمة فيها:
+- ✅ تفاصيل تقنية دقيقة
+- ✅ معايير اختبار واضحة
+- ✅ عزل بين Kernel/User-Space
+- ✅ توثيق إلزامي
+- ✅ خطة طوارئ
+
+---
+
+##  **الطبقة الأولى: HAL + Bootstrapping** (النسخة المحسّنة)
+
+### **الهدف العام:**
+تحويل الجهاز من حالة "إطفاء" إلى نظام جاهز يستقبل الأوامر، عبر:
+- الإقلاع من الصفر (Bootloader)
+- تهيئة المعالج والذاكرة الأساسية
+- توفير قنوات إخراج وتصحيح (شاشة نصية + Serial)
+- تمكين الاستجابة للأحداث الأساسية (مؤقت + كيبورد)
+
+### **الحدود الواضحة (Boundaries):**
+| مسموح | ممنوع |
+|-------|--------|
+| ✅ الوصول المباشر للهاردوير (Ports, MMIO) | ❌ أي كود User-Space |
+| ✅ تهيئة الذاكرة الفيزيائية | ❌ تحميل ملفات أو نظام ملفات |
+| ✅ إعداد المقاطعات الأساسية | ❌ تشغيل تطبيقات |
+| ✅ إخراج تصحيحي (Serial/VGA) | ❌ أي اتصال بشبكة |
+
+---
+
+## 🧩 **المهام الدقيقة (6 مهام)**
+
+### **المهمة 1: إعداد بيئة البناء وملف الربط**
+
+#### 📋 **المواصفات التفصيلية:**
+```
+الملفات المطلوبة:
+├── Makefile
+├── linker.ld
+├── include/
+│   ├── types.h        (تعريفات uint8_t, size_t, NULL...)
+│   └── compiler.h     (macros: UNUSED, PACKED, ALWAYS_INLINE...)
+└── kernel/
+    └── main.c         (دالة kernel_main فارغة)
+```
+
+#### 🔧 **التفاصيل التقنية:**
+**linker.ld:**
+```ld
+/* 
+ * Layer: 1 (HAL/Bootstrap)
+ * Purpose: تحديد خريطة الذاكرة للنواة
+ * Constraints: لا يتجاوز 50KB في هذه المرحلة
+ */
+
+ENTRY(boot_start)
+
+SECTIONS
+{
+    . = 1M;
+
+    .boot :
+    {
+        __boot_start = .;
+        *(.boot)
+        __boot_end = .;
+    }
+
+    .text :
+    {
+        __text_start = .;
+        *(.text)
+        __text_end = .;
+    }
+
+    .rodata :
+    {
+        __rodata_start = .;
+        *(.rodata)
+        __rodata_end = .;
+    }
+
+    .data :
+    {
+        __data_start = .;
+        *(.data)
+        __data_end = .;
+    }
+
+    .bss :
+    {
+        __bss_start = .;
+        *(.bss)
+        *(COMMON)
+        __bss_end = .;
+    }
+
+    __kernel_end = .;
+}
+```
+
+**Makefile:**
+```makefile
+# Layer: 1 Build System
+# Purpose: تجميع النواة بأمان واختبارها
+
+CC = x86_64-elf-gcc
+AS = x86_64-elf-as
+LD = x86_64-elf-ld
+
+CFLAGS = -ffreestanding -fno-stack-protector -fno-pic \
+         -mno-red-zone -mgeneral-regs-only \
+         -Wall -Wextra -Werror -std=gnu11 \
+         -Iinclude
+
+ASFLAGS = -g
+
+LDFLAGS = -T linker.ld -nostdlib
+
+SRCS = kernel/boot.s kernel/main.c
+OBJS = $(SRCS:.c=.o)
+OBJS = $(OBJS:.s=.o)
+
+TARGET = kernel.bin
+
+.PHONY: all clean run debug test
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	@echo "🔗 Linking $(TARGET)..."
+	$(LD) $(LDFLAGS) -o $@ $^
+	@echo "✅ Build complete. Size: $$(stat -c%s $(TARGET)) bytes"
+
+%.o: %.c
+	@echo "📝 Compiling $<..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.s
+	@echo "🔧 Assembling $<..."
+	$(AS) $(ASFLAGS) $< -o $@
+
+clean:
+	rm -f $(OBJS) $(TARGET) kernel.elf
+
+run: $(TARGET)
+	qemu-system-x86_64 -kernel $(TARGET) -serial stdio -monitor stdio
+
+debug: $(TARGET)
+	qemu-system-x86_64 -kernel $(TARGET) -s -S -serial stdio
+
+test: $(TARGET)
+	@echo "🧪 Running basic tests..."
+	@size $(TARGET) | awk '/^Total/ {if ($$2 < 51200) print "✅ Size OK (<50KB)"; else {print "❌ Size too large"; exit 1}}'
+	@echo "✅ All build tests passed"
+```
+
+#### ✅ **معيار النجاح:**
+```bash
+$ make test
+🔗 Linking kernel.bin...
+✅ Build complete. Size: 2048 bytes
+🧪 Running basic tests...
+✅ Size OK (<50KB)
+✅ All build tests passed
+```
+
+#### 🆘 **خطة الطوارئ:**
+| المشكلة | الحل |
+|---------|------|
+| `x86_64-elf-gcc: command not found` | شغل: `sudo apt install x86_64-elf-binutils x86_64-elf-gcc` |
+| `linker.ld:1: syntax error` | تأكد إن الملف بصيغة Unix (LF) مش Windows (CRLF) |
+| Size أكبر من 50KB | راجع إنك مش رابط مكتبات بالغلط (`-nostdlib` موجودة) |
+
+---
+
+### **المهمة 2: الإقلاع والدخول إلى 64-bit Long Mode**
+
+#### 📋 **المواصفات التفصيلية:**
+```
+الملفات المطلوبة:
+└── kernel/
+    └── boot.s         (Assembly: Multiboot2, GDT, Paging, Long Mode)
+```
+
+#### 🔧 **التفاصيل التقنية:**
+**boot.s:**
+```asm
+/*
+ * Layer: 1 (HAL/Bootstrap)
+ * Purpose: تهيئة المعالج والدخول لـ Long Mode
+ * Constraints: لا يستخدم أي دوال C في هذه المرحلة
+ * Status: [ ] Testing [ ] Pass [ ] Failed
+ */
+
+# Multiboot2 constants
+.set MULTIBOOT2_MAGIC, 0x36d76289
+.set MULTIBOOT2_ARCH, 0
+.set MULTIBOOT2_HEADER_LEN, 8
+
+# Stack setup
+.set STACK_SIZE, 0x4000
+
+.section .boot, "ax"
+.align 8
+
+# Multiboot2 Header
+multiboot_header:
+    .short MULTIBOOT2_MAGIC          # Magic number
+    .short MULTIBOOT2_ARCH           # Architecture (0 = i386)
+    .long MULTIBOOT2_HEADER_LEN      # Header length
+    .long 0x90123456                 # Checksum (will be calculated)
+
+boot_start:
+    # Disable interrupts
+    cli
+
+    # Check Multiboot2 magic
+    cmp $MULTIBOOT2_MAGIC, %eax
+    jne no_multiboot
+
+    # Save Multiboot2 info pointer
+    mov %ebx, multiboot_info_ptr
+
+    # Load GDT
+    lgdt gdt_descriptor
+
+    # Enable A20 line (Fast method)
+    inb $0x92, %al
+    orb $0x02, %al
+    outb %al, $0x92
+
+    # Disable PIC (Programmable Interrupt Controller)
+    movb $0xff, %al
+    outb %al, $0xa1
+    outb %al, $0x21
+
+    # Enable Paging and enter Long Mode
+    call setup_paging
+    call enable_long_mode
+
+    # Jump to 64-bit code
+    lgdt gdt64_descriptor
+    mov $0x18, %ax          # 64-bit code segment
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    ljmp $0x18, $long_mode_entry
+
+no_multiboot:
+    # Hang if not booted with Multiboot2
+    cli
+    hlt
+    jmp no_multiboot
+
+.section .data
+multiboot_info_ptr:
+    .quad 0
+
+.section .bss
+.align 16
+stack_bottom:
+    .skip STACK_SIZE
+stack_top:
+
+.section .text
+.global kernel_main
+```
+
+#### ✅ **معيار النجاح:**
+```bash
+$ qemu-system-x86_64 -kernel kernel.bin -serial stdio
+# يجب أن يظهر في Serial:
+"🚀 CPU Ready - Long Mode Active"
+# ولا يحدث Triple Fault
+```
+
+#### 🆘 **خطة الطوارئ:**
+| المشكلة | الحل |
+|---------|------|
+| Triple Fault عند الإقلاع | راجع `cr0` و `cr4` settings، وتأكد من محاذاة الصفحات |
+| `no_multiboot` hang | تأكد إنك بتشغل بـ `-kernel` مش `-hda` |
+
+---
+
+### **المهمة 3: اكتشاف الذاكرة وإعداد مُخصص بسيط**
+
+#### 📋 **المواصفات التفصيلية:**
+```
+الملفات المطلوبة:
+├── kernel/
+│   ├── memory.c
+│   └── memory.h
+└── include/
+    └── multiboot2.h
+```
+
+#### 🔧 **التفاصيل التقنية:**
+**memory.h:**
+```c
+/*
+ * Layer: 1 (HAL/Bootstrap)
+ * Purpose: إدارة الذاكرة الفيزيائية البسيطة
+ * Constraints: لا يدعم virtual memory في هذه المرحلة
+ * Dependencies: multiboot2.h
+ */
+
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#include <types.h>
+
+#define PAGE_SIZE 4096
+#define MAX_MEMORY_REGIONS 32
+
+typedef struct {
+    uint64_t base;
+    uint64_t length;
+    uint32_t type;  // 1 = usable, others = reserved
+} memory_region_t;
+
+typedef struct {
+    uint64_t total_memory;
+    uint64_t usable_memory;
+    uint64_t next_free_page;
+    uint64_t total_pages;
+    uint64_t free_pages;
+} memory_map_t;
+
+// Function prototypes
+void memory_init(uint64_t multiboot_info_ptr);
+uint64_t pmm_alloc_page(void);
+void pmm_free_page(uint64_t addr);
+void memory_print_info(void);
+
+// Test function
+void test_memory_allocator(void);
+
+#endif
+```
+
+**memory.c:**
+```c
+/*
+ * Layer: 1 (HAL/Bootstrap)
+ * Purpose: تنفيذ إدارة الذاكرة الفيزيائية
+ * Status: [ ] Testing [ ] Pass [ ] Failed
+ */
+
+#include "memory.h"
+#include <multiboot2.h>
+#include <compiler.h>
+
+static memory_map_t mem_map = {0};
+static memory_region_t regions[MAX_MEMORY_REGIONS];
+static uint32_t num_regions = 0;
+
+static uint8_t *page_bitmap = NULL;
+static uint64_t bitmap_size = 0;
+
+void memory_init(uint64_t multiboot_ptr)
+{
+    struct multiboot_info *mboot = (struct multiboot_info *)multiboot_ptr;
+    
+    // Parse memory map from Multiboot2
+    // ... (implementation details)
+    
+    mem_map.total_memory = 0;
+    mem_map.usable_memory = 0;
+    
+    for (uint32_t i = 0; i < num_regions; i++) {
+        mem_map.total_memory += regions[i].length;
+        if (regions[i].type == 1) {
+            mem_map.usable_memory += regions[i].length;
+        }
+    }
+    
+    mem_map.total_pages = mem_map.usable_memory / PAGE_SIZE;
+    mem_map.free_pages = mem_map.total_pages;
+    mem_map.next_free_page = 0x100000; // Start after 1MB
+    
+    // Initialize page bitmap
+    bitmap_size = (mem_map.total_pages + 7) / 8;
+    page_bitmap = (uint8_t *)0x200000; // Reserve memory for bitmap
+    
+    // Clear bitmap (all pages free)
+    for (uint64_t i = 0; i < bitmap_size; i++) {
+        page_bitmap[i] = 0;
+    }
+}
+
+uint64_t pmm_alloc_page(void)
+{
+    // Simple bitmap allocator
+    for (uint64_t i = 0; i < mem_map.total_pages; i++) {
+        uint64_t byte_idx = i / 8;
+        uint8_t bit_idx = i % 8;
+        
+        if (!(page_bitmap[byte_idx] & (1 << bit_idx))) {
+            // Page is free, mark as used
+            page_bitmap[byte_idx] |= (1 << bit_idx);
+            mem_map.free_pages--;
+            
+            uint64_t addr = 0x100000 + (i * PAGE_SIZE);
+            return addr;
+        }
+    }
+    
+    // No free pages
+    return 0;
+}
+
+void pmm_free_page(uint64_t addr)
+{
+    uint64_t page_idx = (addr - 0x100000) / PAGE_SIZE;
+    uint64_t byte_idx = page_idx / 8;
+    uint8_t bit_idx = page_idx % 8;
+    
+    page_bitmap[byte_idx] &= ~(1 << bit_idx);
+    mem_map.free_pages++;
+}
+
+void memory_print_info(void)
+{
+    kprintf("📊 Memory Info:\n");
+    kprintf("  Total: %llu MB\n", mem_map.total_memory / (1024 * 1024));
+    kprintf("  Usable: %llu MB\n", mem_map.usable_memory / (1024 * 1024));
+    kprintf("  Pages: %llu total, %llu free\n", 
+            mem_map.total_pages, mem_map.free_pages);
+}
+
+void test_memory_allocator(void)
+{
+    kprintf("🧪 Testing memory allocator...\n");
+    
+    uint64_t test_pages[10];
+    uint64_t allocated = 0;
+    
+    // Allocate 10 pages
+    for (int i = 0; i < 10; i++) {
+        test_pages[i] = pmm_alloc_page();
+        if (test_pages[i] != 0) {
+            allocated++;
+            // Write test pattern
+            uint64_t *ptr = (uint64_t *)test_pages[i];
+            *ptr = 0xDEADBEEFCAFEBABE;
+        }
+    }
+    
+    // Verify
+    uint64_t verified = 0;
+    for (int i = 0; i < 10; i++) {
+        if (test_pages[i] != 0) {
+            uint64_t *ptr = (uint64_t *)test_pages[i];
+            if (*ptr == 0xDEADBEEFCAFEBABE) {
+                verified++;
+            }
+            pmm_free_page(test_pages[i]);
+        }
+    }
+    
+    if (allocated == 10 && verified == 10) {
+        kprintf("✅ Memory allocator test PASSED\n");
+    } else {
+        kprintf("❌ Memory allocator test FAILED: alloc=%llu, verify=%llu\n", 
+                allocated, verified);
+    }
+}
+```
+
+#### ✅ **معيار النجاح:**
+```
+🧪 Testing memory allocator...
+✅ Memory allocator test PASSED
+📊 Memory Info:
+  Total: 2048 MB
+  Usable: 1920 MB
+  Pages: 491520 total, 491510 free
+```
+
+---
+
+### **المهمة 4: إخراج الشاشة النصية + منفذ التصحيح**
+
+#### 📋 **الملفات:**
+```
+├── kernel/
+│   ├── vga.c
+│   ├── vga.h
+│   ├── serial.c
+│   └── serial.h
+└── include/
+    └── kprintf.h
+```
+
+#### 🔧 **kprintf.h:**
+```c
+/*
+ * Layer: 1 (HAL/Bootstrap)
+ * Purpose: واجهة طباعة موحدة للشاشة والـ Serial
+ * Constraints: لا تستخدم libc
+ */
+
+#ifndef KPRINTF_H
+#define KPRINTF_H
+
+#include <types.h>
+#include <compiler.h>
+
+// Initialize output systems
+void kprintf_init(void);
+
+// Print formatted string (limited printf)
+int kprintf(const char *format, ...);
+
+// Print emergency message (before full init)
+void kprintf_early(const char *str);
+
+// Test function
+void test_kprintf(void);
+
+#endif
+```
+
+#### ✅ **معيار النجاح:**
+```
+🧪 Testing kprintf...
+  Screen: "Hello from Madar OS"
+  Serial: "Serial OK"
+✅ kprintf test PASSED
+```
+
+---
+
+### **المهمة 5: تهيئة المقاطعات الأساسية (IDT + IRQ)**
+
+#### 📋 **الملفات:**
+```
+├── kernel/
+│   ├── idt.c
+│   ├── idt.h
+│   ├── pic.c
+│   └── pic.h
+└── arch/
+    └── interrupt_handlers.s
+```
+
+#### ✅ **معيار النجاح:**
+```
+🧪 Testing interrupt system...
+  Timer IRQ: Active (counting...)
+  Keyboard IRQ: Active (press a key...)
+✅ Interrupt system test PASSED
+```
+
+---
+
+### **المهمة 6: التكامل النهائي واختبار الاستقرار**
+
+#### 📋 **الملفات:**
+```
+├── kernel/
+│   └── main.c
+└── tests/
+    └── layer1_integration.c
+```
+
+#### 🔧 **main.c:**
+```c
+/*
+ * Layer: 1 (HAL/Bootstrap) - Main Entry Point
+ * Purpose: تجميع واختبار كل مكونات الطبقة الأولى
+ * Status: [ ] Testing [ ] Pass [ ] Failed
+ * Dependencies: memory, vga, serial, idt, pic
+ */
+
+#include <kprintf.h>
+#include <memory.h>
+#include <idt.h>
+#include <multiboot2.h>
+
+void kernel_main(uint32_t magic, struct multiboot_info *mboot)
+{
+    // Early initialization
+    kprintf_init();
+    
+    kprintf("🚀 Madar OS - Layer 1 Starting...\n");
+    kprintf("  Multiboot Magic: 0x%x\n", magic);
+    
+    // Initialize subsystems
+    memory_init((uint64_t)mboot);
+    idt_init();
+    pic_init();
+    
+    // Run integration tests
+    test_memory_allocator();
+    test_kprintf();
+    test_interrupt_system();
+    
+    // Final status
+    kprintf("✅ Layer 1: All systems operational\n");
+    kprintf("🎯 Ready for Layer 2 (Kernel Core)\n");
+    
+    // Enable interrupts
+    asm volatile("sti");
+    
+    // Idle loop
+    while (1) {
+        asm volatile("hlt");
+    }
+}
+```
+
+#### ✅ **معيار النجاح النهائي:**
+```bash
+$ make run
+# في QEMU:
+🚀 Madar OS - Layer 1 Starting...
+  Multiboot Magic: 0x36d76289
+🧪 Testing memory allocator...
+✅ Memory allocator test PASSED
+🧪 Testing kprintf...
+✅ kprintf test PASSED
+🧪 Testing interrupt system...
+✅ Interrupt system test PASSED
+✅ Layer 1: All systems operational
+🎯 Ready for Layer 2 (Kernel Core)
+
+# تشغيل مستمر 5 دقائق بدون أخطاء
+```
+
+---
+
+## 📊 **ملخص الطبقة الأولى المحسّنة**
+
+| المهمة | الملفات | الوقت المتوقع | معيار النجاح |
+|--------|---------|---------------|--------------|
+| 1. بيئة البناء | Makefile, linker.ld | 1 ساعة | Size < 50KB |
+| 2. Long Mode | boot.s | 2 ساعة | لا Triple Fault |
+| 3. الذاكرة | memory.c/h | 3 ساعات | 10 صفحات OK |
+| 4. الإخراج | vga.c, serial.c | 2 ساعة | kprintf يعمل |
+| 5. المقاطعات | idt.c, pic.c | 3 ساعات | Timer/Keyboard |
+| 6. التكامل | main.c | 1 ساعة | 5 دقائق استقرار |
+
+**الإجمالي: ~12 ساعة عمل**
+
+---
+
+## 🛡️ **البروتوكولات الوقائية المدمجة**
+
+1. ✅ **User-Space Isolation:** كل الكود في Kernel Space، مفيش تطبيقات خالص
+2. ✅ **Minimal Implementation:** بس الـ 6 مهام الأساسية، من غير تعقيد
+3. ✅ **Testing Checklist:** كل مهمة ليها test_XYZ()
+4. ✅ **Documentation:** كل ملف فيه Header واضح
+5. ✅ **Clear Boundaries:** مفيش خلط بين المهام
+
+---
+
+**هل تحب أبدأ أكتبلك الكود الكامل لأي مهمة معينة دلوقتي؟** ولا عايز تضيف حاجة تانية قبل ما نبدأ التنفيذ؟
+
+أنا معاك يا بطل، وهنخلي الطبقة الأولى تمشي صح من أول سطر! 💪
+
+وصلى الله على سيدنا محمد وعلى آله وصحبه وسلم.
